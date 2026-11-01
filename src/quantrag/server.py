@@ -1,0 +1,353 @@
+"""QuantRAG MCP server.
+
+Exposes two tools, ``ask_quant_question`` and ``search_quant_kb``, that share
+a single :class:`quantrag.service.RagService` instance so retrieval and
+answering are consistent across transports.
+
+The server speaks MCP over stdio by default.  ``MCP_TRANSPORT=streamable-http``
+starts the combined REST + MCP server on ``PORT`` (the container/cloud path);
+``--transport streamable-http`` keeps the MCP-only FastMCP server for debugging.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from typing import Any
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+
+from .config import DEFAULT_PORT, load_rag_settings, load_transport_settings
+from .errors import (
+    ConfigurationError,
+    RetrievalError,
+)
+from .service import RagService, build_service
+
+logger = logging.getLogger("quantrag")
+
+SERVER_NAME = "quantrag"
+ASK_TOOL = "ask_quant_question"
+SEARCH_TOOL = "search_quant_kb"
+
+ASK_DESCRIPTION = (
+    "Answer a quantitative-finance question (markets, derivatives, portfolio "
+    "construction, risk metrics, time series, backtesting) using the "
+    "retrieval-augmented knowledge base."
+)
+
+SEARCH_DESCRIPTION = (
+    "Search the quantitative-finance knowledge base for relevant passages. "
+    "Returns ranked snippets with metadata for citations."
+)
+
+
+async def _get_service() -> RagService:
+    """Lazy singleton: build the service on first use."""
+    global _SERVICE
+    if _SERVICE is not None:
+        return _SERVICE
+    _SERVICE = await build_service()
+    return _SERVICE
+
+
+_SERVICE: RagService | None = None
+
+
+def create_server(
+    *,
+    service: RagService | None = None,
+    streamable_http_path: str = "/mcp",
+    transport_security=None,
+) -> FastMCP:
+    """Build the FastMCP server, optionally with an injected service (tests).
+
+    When mounted under FastAPI at ``/mcp``, set ``streamable_http_path="/"`
+    so that the MCP route matches after the mount prefix is stripped.
+
+    Set ``transport_security=None`` to disable DNS rebinding protection when
+    the MCP endpoint is behind our own X-API-Key authentication middleware.
+    """
+    global _SERVICE
+    if service is not None:
+        _SERVICE = service
+
+    async def get_svc() -> RagService:
+        return await _get_service()
+
+    server = FastMCP(
+        SERVER_NAME,
+        instructions=(
+            "Quantitative-finance retrieval-augmented answering. "
+            f"Use {ASK_TOOL} for grounded answers and {SEARCH_TOOL} for raw search."
+        ),
+        streamable_http_path=streamable_http_path,
+        transport_security=transport_security,
+    )
+
+    @server.tool(name=ASK_TOOL, description=ASK_DESCRIPTION)
+    async def ask_quant_question(
+        question: str,
+        *,
+        k: int | None = None,
+        mode: str | None = None,
+    ) -> dict[str, object]:
+        """Answer a quantitative-finance question with grounded citations."""
+        text = question.strip() if isinstance(question, str) else ""
+        if not text:
+            raise ToolError("The 'question' argument must be a non-empty string.")
+
+        try:
+            svc = await get_svc()
+            result = await svc.ask(text, k=k, mode=mode)
+        except ConfigurationError as exc:
+            raise ToolError(f"QuantRAG is not configured: {exc}") from exc
+        except RetrievalError as exc:
+            raise ToolError(f"QuantRAG retrieval failed: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Unexpected failure while answering a question")
+            raise ToolError(
+                f"QuantRAG hit an unexpected error ({type(exc).__name__}). "
+                "See the server logs for details."
+            ) from exc
+
+        return result.to_dict()
+
+    @server.tool(name=SEARCH_TOOL, description=SEARCH_DESCRIPTION)
+    async def search_quant_kb(
+        query: str,
+        *,
+        k: int | None = None,
+        mode: str | None = None,
+        min_score: float | None = None,
+    ) -> dict[str, object]:
+        """Search the knowledge base and return ranked snippets."""
+        text = query.strip() if isinstance(query, str) else ""
+        if not text:
+            raise ToolError("The 'query' argument must be a non-empty string.")
+
+        try:
+            svc = await get_svc()
+            hits = await svc.search(text, k=k, mode=mode, min_score=min_score)
+        except ConfigurationError as exc:
+            raise ToolError(f"QuantRAG is not configured: {exc}") from exc
+        except RetrievalError as exc:
+            raise ToolError(f"QuantRAG retrieval failed: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Unexpected failure while searching the knowledge base")
+            raise ToolError(
+                f"QuantRAG hit an unexpected error ({type(exc).__name__}). "
+                "See the server logs for details."
+            ) from exc
+
+        return {
+            "results": [hit.to_dict() for hit in hits],
+            "count": len(hits),
+            "mode": mode or (await get_svc()).settings.mode,
+        }
+
+    return server
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Send logs to stderr so stdout stays free for the MCP protocol."""
+    root = logging.getLogger()
+    if not any(getattr(h, "_quantrag", False) for h in root.handlers):
+        handler = logging.StreamHandler(stream=sys.stderr)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler._quantrag = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
+# ------------------------------------------------------------------
+# Optional HTTP backend transport (for deployment with REST API)
+# ------------------------------------------------------------------
+
+API_KEY_ENV = "QUANTRAG_API_KEY"
+API_URL_ENV = "QUANTRAG_API_URL"
+
+
+class HttpRagClient:
+    """Forward MCP tool calls to the REST API with X-API-Key header.
+
+    Used when ``QUANTRAG_API_URL`` is configured.  If ``QUANTRAG_API_KEY``
+    is set, it is forwarded in the ``X-API-Key`` header.  Missing
+    ``QUANTRAG_API_URL`` falls back to the local in-process service.
+    """
+
+    def __init__(self, base_url: str | None = None):
+        self.base_url = (base_url or os.environ.get(API_URL_ENV) or "").strip()
+        self.api_key = os.environ.get(API_KEY_ENV) or ""
+        self.client = httpx.AsyncClient(timeout=60.0) if self.base_url else None
+
+    async def ask(self, text: str, *, k: int | None = None, mode: str | None = None) -> Any:
+        if not self.base_url or not self.client:
+            raise ConfigurationError("QUANTRAG_API_URL is not configured; cannot use HTTP backend.")
+        headers = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            resp = await self.client.post(
+                f"{self.base_url.rstrip('/')}/ask",
+                headers=headers,
+                json={
+                    "question": text,
+                    "k": k,
+                    "mode": mode,
+                },
+            )
+            if resp.status_code == 401:
+                raise ToolError("QuantRAG authentication failed: invalid or missing API key.")
+            if resp.status_code == 504:
+                raise ToolError("QuantRAG upstream timeout: REST API did not respond.")
+            if resp.status_code == 429:
+                raise ToolError("QuantRAG rate limit exceeded: try again later.")
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException as exc:
+            logger.error("QuantRAG REST timeout: %s", exc)
+            raise ToolError("QuantRAG upstream timeout.") from exc
+        except httpx.HTTPStatusError as exc:
+            logger.error("QuantRAG REST error: %s (status %d)", exc, exc.response.status_code)
+            raise ToolError(f"Upstream error ({exc.response.status_code})") from exc
+
+    async def search(
+        self,
+        text: str,
+        *,
+        k: int | None = None,
+        mode: str | None = None,
+        min_score: float | None = None,
+    ) -> Any:
+        if not self.base_url or not self.client:
+            raise ConfigurationError("QUANTRAG_API_URL is not configured; cannot use HTTP backend.")
+        headers = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            resp = await self.client.post(
+                f"{self.base_url.rstrip('/')}/search",
+                headers=headers,
+                json={
+                    "query": text,
+                    "k": k,
+                    "mode": mode,
+                    "min_score": min_score,
+                },
+            )
+            if resp.status_code == 401:
+                raise ToolError("QuantRAG authentication failed: invalid or missing API key.")
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException as exc:
+            logger.error("QuantRAG REST timeout: %s", exc)
+            raise ToolError("QuantRAG upstream timeout.") from exc
+        except httpx.HTTPStatusError as exc:
+            logger.error("QuantRAG REST error: %s (status %d)", exc, exc.response.status_code)
+            raise ToolError(f"Upstream error ({exc.response.status_code})") from exc
+
+    async def aclose(self) -> None:
+        if self.client:
+            await self.client.aclose()
+
+
+# ------------------------------------------------------------------
+# Tool-level error mapping for upstream REST failures
+# ------------------------------------------------------------------
+
+
+def _map_rest_error_to_tool_text(status_code: int) -> str:
+    if status_code == 401:
+        return "QuantRAG authentication failed (check your configured API key)."
+    if status_code == 429:
+        return "QuantRAG rate limit exceeded."
+    if status_code == 504:
+        return "QuantRAG upstream timeout."
+    if status_code >= 500:
+        return "QuantRAG upstream server error."
+    return f"QuantRAG upstream error (status {status_code})."
+
+
+def _argv_transport(argv: list[str] | None) -> str | None:
+    """Return an explicit ``--transport`` value, if one was supplied."""
+    if not argv or "--transport" not in argv:
+        return None
+    try:
+        return argv[argv.index("--transport") + 1]
+    except (IndexError, ValueError):
+        return None
+
+
+def _run_http_app(port: int) -> int:
+    """Start the combined REST + MCP FastAPI app on 0.0.0.0:``port``.
+
+    Imported lazily so that stdio mode does not require the ``api`` extra.
+    """
+    try:
+        import uvicorn
+
+        from .api import app as http_app
+    except ImportError as exc:  # pragma: no cover - depends on optional extra
+        raise ConfigurationError(
+            "MCP_TRANSPORT=streamable-http requires the 'api' extra "
+            "(fastapi + uvicorn). Install with: uv sync --extra api"
+        ) from exc
+
+    logger.info("Starting QuantRAG REST+MCP server on http://0.0.0.0:%d", port)
+    uvicorn.run(http_app, host="0.0.0.0", port=port, log_level="info")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: run over stdio (default) or streamable-http.
+
+    Transport precedence: an explicit ``--transport`` argument wins over the
+    ``MCP_TRANSPORT`` environment variable.  When ``streamable-http`` comes from
+    the environment (the cloud/container path) the combined FastAPI app is
+    started, so ``/health``, ``/ask``, ``/search`` and ``/mcp`` share one
+    process.  An explicit ``--transport streamable-http`` keeps the legacy
+    MCP-only FastMCP server for manual debugging.
+    """
+    configure_logging()
+
+    explicit_transport = _argv_transport(argv)
+    if explicit_transport is not None:
+        transport = explicit_transport
+        port = DEFAULT_PORT
+    else:
+        try:
+            transport, port = load_transport_settings(load_env_file=True)
+        except ConfigurationError as exc:
+            logger.error("%s", exc)
+            return 2
+
+    if transport not in {"stdio", "streamable-http"}:
+        logger.error("Unknown transport %r; expected 'stdio' or 'streamable-http'.", transport)
+        return 2
+
+    try:
+        load_rag_settings(load_env_file=True)
+    except ConfigurationError as exc:
+        logger.warning("QuantRAG is not fully configured: %s", exc)
+
+    if transport == "streamable-http" and explicit_transport is None:
+        try:
+            return _run_http_app(port)
+        except ConfigurationError as exc:
+            logger.error("%s", exc)
+            return 2
+
+    server = create_server()
+    try:
+        server.run(transport=transport)
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        logger.info("Shutting down.")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

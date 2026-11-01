@@ -1,0 +1,56 @@
+# --- Secrets / local configuration ---
+.env
+.env.*
+!.env.example
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Build / download artefacts ---
+*.zip
+new*.zip
+quantrag_*.zip
+pdfs/
+
+# --- Python caches / build artefacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# --- Ingestion artefacts ---
+data/raw/
+data/chunks.jsonl
+# Keep the prebuilt runtime index for Docker deployment,
+# but do not include unexpected files inside it.
+data/index/*
+!data/index/manifest.json
+!data/index/chunks.jsonl
+!data/index/vectors.json
+!data/index/embedder.json
+data/ingest_report.json
+data/ingest_report.csv
+data/ingest_report.dryrun.json
+data/ingest_report.dryrun.csv
+
+# Manual source documents (large, licence-unclear)
+data/manual/*
+!data/manual/README.md
+
+# --- Local staging and rollback artefacts ---
+data/staging/
+data/.quantrag_index_rollback_*
+data/.quantrag_index_stage_*
+data/.quantrag_candidate_prepared_*
+
+Add-Content .gitignore "`n.env`n.env.docker`n*.zip"
+git check-ignore -v .env .env.docker
+.env
+.env.docker
+*.zip
